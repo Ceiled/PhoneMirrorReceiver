@@ -1,257 +1,27 @@
 <!DOCTYPE html>
 <html>
-<head>
-    <meta charset="utf-8">
-    <style>
-        * { margin: 0; padding: 0; }
-        html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-        canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; }
-        #status {
-            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            color: #888; font: 24px sans-serif; text-align: center;
-        }
-    </style>
-</head>
-<body>
-    <canvas id="display"></canvas>
-    <div id="status">Waiting for session...</div>
-
-    <!-- Cast Web Receiver SDK -->
+<head><meta charset="utf-8"></head>
+<body style="background:#000">
+    <!-- Cast bootstrapper: receives session info via CASTV2, redirects to server -->
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <!-- SignalR + MessagePack (same versions as main app) -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/msgpack5@6.0.2/dist/msgpack5.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr-protocol-msgpack@8.0.0/dist/browser/signalr-protocol-msgpack.min.js"></script>
-
     <script>
-    'use strict';
+    const ctx = cast.framework.CastReceiverContext.getInstance();
+    const NS = 'urn:x-cast:com.phonemirror.session';
 
-    // --- H.264 helpers (from mirror.js) ---
-
-    function toBytes(data) {
-        if (data instanceof Uint8Array) return data;
-        if (data instanceof ArrayBuffer) return new Uint8Array(data);
-        return data;
-    }
-
-    function parseAnnexBNalUnits(data) {
-        const units = [];
-        let i = 0;
-        while (i < data.length - 3) {
-            let sc = 0;
-            if (data[i] === 0 && data[i + 1] === 0) {
-                if (data[i + 2] === 1) sc = 3;
-                else if (data[i + 2] === 0 && i + 3 < data.length && data[i + 3] === 1) sc = 4;
-            }
-            if (sc === 0) { i++; continue; }
-            const nalStart = i + sc;
-            let nalEnd = data.length;
-            for (let j = nalStart + 1; j < data.length - 2; j++) {
-                if (data[j] === 0 && data[j + 1] === 0 &&
-                    (data[j + 2] === 1 || (data[j + 2] === 0 && j + 3 < data.length && data[j + 3] === 1))) {
-                    nalEnd = j;
-                    break;
-                }
-            }
-            while (nalEnd > nalStart && data[nalEnd - 1] === 0) nalEnd--;
-            if (nalEnd > nalStart) {
-                units.push({ offset: nalStart, length: nalEnd - nalStart, nalType: data[nalStart] & 0x1F });
-            }
-            i = nalEnd;
-        }
-        return units;
-    }
-
-    function extractCodecStringFromSPS(spsBody) {
-        const p = spsBody[1], c = spsBody[2], l = spsBody[3];
-        return `avc1.${p.toString(16).padStart(2, '0')}${c.toString(16).padStart(2, '0')}${l.toString(16).padStart(2, '0')}`;
-    }
-
-    function buildAVCDecoderConfigRecord(spsBody, ppsBody) {
-        const buf = new Uint8Array(6 + 2 + spsBody.length + 1 + 2 + ppsBody.length);
-        let i = 0;
-        buf[i++] = 1;
-        buf[i++] = spsBody[1];
-        buf[i++] = spsBody[2];
-        buf[i++] = spsBody[3];
-        buf[i++] = 0xFF;
-        buf[i++] = 0xE1;
-        buf[i++] = (spsBody.length >> 8) & 0xFF;
-        buf[i++] = spsBody.length & 0xFF;
-        buf.set(spsBody, i); i += spsBody.length;
-        buf[i++] = 1;
-        buf[i++] = (ppsBody.length >> 8) & 0xFF;
-        buf[i++] = ppsBody.length & 0xFF;
-        buf.set(ppsBody, i);
-        return buf;
-    }
-
-    // --- WebCodecs H.264 decoder ---
-
-    const canvas = document.getElementById('display');
-    const ctx = canvas.getContext('2d');
-    const statusEl = document.getElementById('status');
-
-    let decoder = null;
-    let configured = false;
-    let pendingFrames = 0;
-    let timestamp = 0;
-    let framesRendered = 0;
-
-    function initDecoder() {
-        if (decoder) { try { decoder.close(); } catch (e) {} }
-        configured = false;
-        timestamp = 0;
-        pendingFrames = 0;
-        decoder = new VideoDecoder({
-            output: (videoFrame) => {
-                pendingFrames--;
-                if (canvas.width !== videoFrame.displayWidth ||
-                    canvas.height !== videoFrame.displayHeight) {
-                    canvas.width = videoFrame.displayWidth;
-                    canvas.height = videoFrame.displayHeight;
-                }
-                ctx.drawImage(videoFrame, 0, 0);
-                videoFrame.close();
-                framesRendered++;
-                if (framesRendered === 1) statusEl.style.display = 'none';
-            },
-            error: (e) => {
-                console.error('Decoder error:', e);
-                configured = false;
-            }
-        });
-    }
-
-    function configureDecoder(spsBody, ppsBody) {
-        const codecString = extractCodecStringFromSPS(spsBody);
-        if (!decoder || decoder.state === 'closed') initDecoder();
-        decoder.configure({
-            codec: codecString,
-            description: buildAVCDecoderConfigRecord(spsBody, ppsBody),
-            optimizeForLatency: true,
-        });
-        configured = true;
-        pendingFrames = 0;
-        console.log('Decoder configured:', codecString);
-    }
-
-    function renderFrame(frame) {
-        try {
-            const data = toBytes(frame.data);
-            const nalInfos = parseAnnexBNalUnits(data);
-
-            let spsBody = null, ppsBody = null;
-            const vclNals = [];
-            let isKeyFrame = false;
-
-            for (const info of nalInfos) {
-                const body = data.subarray(info.offset, info.offset + info.length);
-                if (info.nalType === 7) spsBody = body;
-                else if (info.nalType === 8) ppsBody = body;
-                else if (info.nalType === 5) { isKeyFrame = true; vclNals.push(body); }
-                else if (info.nalType === 1) vclNals.push(body);
-            }
-
-            if (spsBody && ppsBody) configureDecoder(spsBody, ppsBody);
-            if (!configured || vclNals.length === 0) return;
-            if (decoder.state !== 'configured') return;
-            if (!isKeyFrame && pendingFrames > 5) return;
-
-            let totalLen = 0;
-            for (const nal of vclNals) totalLen += 4 + nal.length;
-            const avcc = new Uint8Array(totalLen);
-            let off = 0;
-            for (const nal of vclNals) {
-                avcc[off] = (nal.length >> 24) & 0xFF;
-                avcc[off + 1] = (nal.length >> 16) & 0xFF;
-                avcc[off + 2] = (nal.length >> 8) & 0xFF;
-                avcc[off + 3] = nal.length & 0xFF;
-                avcc.set(nal, off + 4);
-                off += 4 + nal.length;
-            }
-
-            const chunk = new EncodedVideoChunk({
-                type: isKeyFrame ? 'key' : 'delta',
-                timestamp: timestamp,
-                data: avcc
-            });
-            timestamp += 50000;
-            pendingFrames++;
-            decoder.decode(chunk);
-        } catch (e) {
-            console.error('Render error:', e);
-        }
-    }
-
-    // --- SignalR connection ---
-
-    let connection = null;
-
-    async function connectToHub(hubUrl, deviceId, sourceId) {
-        statusEl.textContent = 'Connecting...';
-        statusEl.style.display = '';
-        console.log(`Connecting to ${hubUrl}/mirrorHub for ${deviceId}/${sourceId}`);
-
-        const connBuilder = new signalR.HubConnectionBuilder()
-            .withUrl(`${hubUrl}/mirrorHub`, {
-                skipNegotiation: true,
-                transport: signalR.HttpTransportType.WebSockets
-            })
-            .withAutomaticReconnect();
-
-        if (signalR.protocols && signalR.protocols.msgpack) {
-            connBuilder.withHubProtocol(new signalR.protocols.msgpack.MessagePackHubProtocol());
-        }
-
-        connection = connBuilder.build();
-
-        connection.on('ReceiveFrame', (frame) => renderFrame(frame));
-
-        connection.onreconnected(async () => {
-            console.log('Reconnected, rejoining session');
-            framesRendered = 0;
-            configured = false;
-            statusEl.textContent = 'Reconnecting...';
-            statusEl.style.display = '';
-            try {
-                await connection.invoke('StartMirroring', deviceId, sourceId, 'h264', 'off', null);
-            } catch (e) {
-                console.error('Rejoin failed:', e);
-            }
-        });
-
-        try {
-            await connection.start();
-            console.log('SignalR connected');
-            await connection.invoke('StartMirroring', deviceId, sourceId, 'h264', 'off', null);
-            console.log('StartMirroring invoked');
-            initDecoder();
-        } catch (e) {
-            console.error('Connection failed:', e);
-            statusEl.textContent = 'Connection failed';
-        }
-    }
-
-    // --- Cast Receiver SDK ---
-
-    const castContext = cast.framework.CastReceiverContext.getInstance();
-    const NAMESPACE = 'urn:x-cast:com.phonemirror.session';
-
-    castContext.addCustomMessageListener(NAMESPACE, (event) => {
-        console.log('Received cast message:', event.data);
+    ctx.addCustomMessageListener(NS, (event) => {
         const { hubUrl, deviceId, sourceId } = event.data;
         if (hubUrl && deviceId && sourceId) {
-            connectToHub(hubUrl, deviceId, sourceId);
+            // Redirect to server's own receiver page (same-origin HTTP, no mixed content)
+            window.location.href = hubUrl + '/cast-receiver.html'
+                + '?deviceId=' + encodeURIComponent(deviceId)
+                + '&sourceId=' + encodeURIComponent(sourceId);
         }
     });
 
-    const options = new cast.framework.CastReceiverOptions();
-    options.disableIdleTimeout = true;
-    options.customNamespaces = { [NAMESPACE]: cast.framework.system.MessageType.JSON };
-
-    castContext.start(options);
-    console.log('Cast receiver started, waiting for session message on', NAMESPACE);
+    ctx.start({
+        disableIdleTimeout: true,
+        customNamespaces: { [NS]: cast.framework.system.MessageType.JSON }
+    });
     </script>
 </body>
 </html>
