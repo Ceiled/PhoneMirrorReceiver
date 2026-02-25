@@ -1,27 +1,221 @@
 <!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"></head>
-<body style="background:#000">
-    <!-- Cast bootstrapper: receives session info via CASTV2, redirects to server -->
-    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script>
-    const ctx = cast.framework.CastReceiverContext.getInstance();
-    const NS = 'urn:x-cast:com.phonemirror.session';
-
-    ctx.addCustomMessageListener(NS, (event) => {
-        const { hubUrl, deviceId, sourceId } = event.data;
-        if (hubUrl && deviceId && sourceId) {
-            // Redirect to server's own receiver page (same-origin HTTP, no mixed content)
-            window.location.href = hubUrl + '/cast-receiver.html'
-                + '?deviceId=' + encodeURIComponent(deviceId)
-                + '&sourceId=' + encodeURIComponent(sourceId);
+<head>
+    <meta charset="utf-8">
+    <style>
+        * { margin: 0; padding: 0; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+        video { display: block; width: 100vw; height: 100vh; object-fit: contain; background: #000; }
+        #status {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #888; font: 24px sans-serif; text-align: center;
         }
-    });
+    </style>
+</head>
+<body>
+    <video id="display" autoplay muted playsinline></video>
+    <div id="status">Waiting for session...</div>
 
-    ctx.start({
-        disableIdleTimeout: true,
-        customNamespaces: { [NS]: cast.framework.system.MessageType.JSON }
-    });
+    <!-- Cast Receiver SDK -->
+    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <!-- SignalR + MessagePack -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/msgpack5@6.0.2/dist/msgpack5.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr-protocol-msgpack@8.0.0/dist/browser/signalr-protocol-msgpack.min.js"></script>
+
+    <script>
+    'use strict';
+
+    const videoEl = document.getElementById('display');
+    const statusEl = document.getElementById('status');
+    const MSE = window.MediaSource || window.ManagedMediaSource;
+    const VERSION = 2;
+
+    console.log(`[PhoneMirror Cast Receiver v${VERSION}]`);
+
+    // --- MSE fMP4 renderer ---
+
+    let mediaSource = null;
+    let sourceBuffer = null;
+    let objectUrl = null;
+    let appendQueue = [];
+    let isAppending = false;
+    let framesReceived = 0;
+    let connection = null;
+
+    function initMSE() {
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try {
+                if (sourceBuffer) mediaSource.removeSourceBuffer(sourceBuffer);
+                mediaSource.endOfStream();
+            } catch (e) {}
+        }
+        if (objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+            objectUrl = null;
+        }
+        sourceBuffer = null;
+        mediaSource = null;
+        isAppending = false;
+        appendQueue = [];
+        framesReceived = 0;
+
+        mediaSource = new MSE();
+        objectUrl = URL.createObjectURL(mediaSource);
+        videoEl.src = objectUrl;
+
+        mediaSource.addEventListener('sourceopen', () => {
+            try {
+                const codecs = ['avc1.42E01E', 'avc1.4D0029', 'avc1.640029'];
+                const codec = codecs.find(c => MSE.isTypeSupported(`video/mp4; codecs="${c}"`)) || 'avc1.42E01E';
+                const mimeType = `video/mp4; codecs="${codec}"`;
+                console.log('MSE sourceopen, codec:', mimeType);
+
+                sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+                sourceBuffer.mode = 'segments';
+                sourceBuffer.addEventListener('updateend', () => {
+                    isAppending = false;
+                    processQueue();
+                });
+                sourceBuffer.addEventListener('error', (e) => {
+                    console.error('SourceBuffer error:', e);
+                    isAppending = false;
+                });
+                processQueue();
+            } catch (e) {
+                console.error('Failed to create SourceBuffer:', e);
+                statusEl.textContent = 'MSE error: ' + e.message;
+                statusEl.style.display = '';
+            }
+        });
+    }
+
+    function processQueue() {
+        if (isAppending || !sourceBuffer || appendQueue.length === 0) return;
+        if (appendQueue.length > 10) {
+            console.warn(`Queue overflow (${appendQueue.length}), dropping`);
+            appendQueue = appendQueue.slice(-3);
+        }
+        isAppending = true;
+        try {
+            sourceBuffer.appendBuffer(appendQueue.shift());
+        } catch (e) {
+            console.error('appendBuffer error:', e);
+            isAppending = false;
+        }
+    }
+
+    function trimBuffer() {
+        if (!sourceBuffer || sourceBuffer.updating || !videoEl.currentTime) return;
+        try {
+            const buffered = sourceBuffer.buffered;
+            if (buffered.length > 0 && videoEl.currentTime - buffered.start(0) > 10) {
+                sourceBuffer.remove(buffered.start(0), videoEl.currentTime - 3);
+            }
+        } catch (e) {}
+    }
+
+    function renderFrame(frame) {
+        const data = frame.data;
+        if (!data || data.length === 0) return;
+
+        const bytes = data instanceof Uint8Array ? data
+            : data instanceof ArrayBuffer ? new Uint8Array(data)
+            : data;
+
+        appendQueue.push(bytes);
+        processQueue();
+
+        framesReceived++;
+        if (framesReceived === 1) {
+            statusEl.style.display = 'none';
+            console.log('First frame received');
+        }
+
+        if (framesReceived % 100 === 0) trimBuffer();
+
+        // Chase live edge
+        if (framesReceived % 30 === 0 && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            if (end - videoEl.currentTime > 1.0) {
+                videoEl.currentTime = end - 0.1;
+            }
+        }
+    }
+
+    // --- Connect to PhoneMirror server ---
+
+    async function startSession(hubUrl, deviceId, sourceId) {
+        console.log(`Connecting to ${hubUrl}/mirrorHub for ${deviceId}/${sourceId}`);
+        statusEl.textContent = 'Connecting to server...';
+
+        // Try WSS first (hubUrl might be https://), fall back to WS
+        const connBuilder = new signalR.HubConnectionBuilder()
+            .withUrl(`${hubUrl}/mirrorHub`, {
+                skipNegotiation: true,
+                transport: signalR.HttpTransportType.WebSockets
+            })
+            .withAutomaticReconnect();
+
+        if (signalR.protocols && signalR.protocols.msgpack) {
+            connBuilder.withHubProtocol(new signalR.protocols.msgpack.MessagePackHubProtocol());
+        }
+
+        connection = connBuilder.build();
+
+        connection.on('ReceiveFrame', renderFrame);
+
+        connection.onreconnected(async () => {
+            console.log('Reconnected, rejoining session');
+            framesReceived = 0;
+            statusEl.textContent = 'Reconnecting...';
+            statusEl.style.display = '';
+            initMSE();
+            try {
+                await connection.invoke('StartMirroring', deviceId, sourceId, 'fmp4', 'off', null);
+            } catch (e) {
+                console.error('Rejoin failed:', e);
+            }
+        });
+
+        try {
+            await connection.start();
+            console.log('SignalR connected');
+            statusEl.textContent = 'Starting mirror...';
+            initMSE();
+            await connection.invoke('StartMirroring', deviceId, sourceId, 'fmp4', 'off', null);
+            console.log('StartMirroring invoked');
+        } catch (e) {
+            console.error('Connection failed:', e);
+            statusEl.textContent = 'Connection failed: ' + e.message;
+            statusEl.style.display = '';
+        }
+    }
+
+    // --- Cast Receiver: listen for session info via CASTV2 ---
+
+    if (!MSE) {
+        statusEl.textContent = 'MediaSource API not available';
+    } else {
+        const castCtx = cast.framework.CastReceiverContext.getInstance();
+        const NS = 'urn:x-cast:com.phonemirror.session';
+
+        castCtx.addCustomMessageListener(NS, (event) => {
+            console.log('CASTV2 message received:', JSON.stringify(event.data));
+            const { hubUrl, deviceId, sourceId } = event.data;
+            if (hubUrl && deviceId && sourceId) {
+                startSession(hubUrl, deviceId, sourceId);
+            }
+        });
+
+        castCtx.start({
+            disableIdleTimeout: true,
+            customNamespaces: { [NS]: cast.framework.system.MessageType.JSON }
+        });
+
+        console.log('Cast receiver started, waiting for session message...');
+    }
     </script>
 </body>
 </html>
