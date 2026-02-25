@@ -26,13 +26,12 @@
 
     <script>
     'use strict';
+    const VERSION = 3;
+    console.log(`[PhoneMirror Cast Receiver v${VERSION}]`);
 
     const videoEl = document.getElementById('display');
     const statusEl = document.getElementById('status');
     const MSE = window.MediaSource || window.ManagedMediaSource;
-    const VERSION = 2;
-
-    console.log(`[PhoneMirror Cast Receiver v${VERSION}]`);
 
     // --- MSE fMP4 renderer ---
 
@@ -93,9 +92,9 @@
 
     function processQueue() {
         if (isAppending || !sourceBuffer || appendQueue.length === 0) return;
-        if (appendQueue.length > 10) {
+        if (appendQueue.length > 5) {
             console.warn(`Queue overflow (${appendQueue.length}), dropping`);
-            appendQueue = appendQueue.slice(-3);
+            appendQueue = appendQueue.slice(-2);
         }
         isAppending = true;
         try {
@@ -110,8 +109,8 @@
         if (!sourceBuffer || sourceBuffer.updating || !videoEl.currentTime) return;
         try {
             const buffered = sourceBuffer.buffered;
-            if (buffered.length > 0 && videoEl.currentTime - buffered.start(0) > 10) {
-                sourceBuffer.remove(buffered.start(0), videoEl.currentTime - 3);
+            if (buffered.length > 0 && videoEl.currentTime - buffered.start(0) > 5) {
+                sourceBuffer.remove(buffered.start(0), videoEl.currentTime - 1);
             }
         } catch (e) {}
     }
@@ -133,14 +132,27 @@
             console.log('First frame received');
         }
 
-        if (framesReceived % 100 === 0) trimBuffer();
+        // Trim old buffer data every 60 frames
+        if (framesReceived % 60 === 0) trimBuffer();
 
-        // Chase live edge
-        if (framesReceived % 30 === 0 && sourceBuffer && sourceBuffer.buffered.length > 0) {
-            const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (end - videoEl.currentTime > 1.0) {
-                videoEl.currentTime = end - 0.1;
-            }
+        // Chase live edge on every frame
+        chaseLiveEdge();
+    }
+
+    function chaseLiveEdge() {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const lag = end - videoEl.currentTime;
+
+        if (lag > 0.8) {
+            // Way behind — jump to near live
+            videoEl.currentTime = end - 0.05;
+            videoEl.playbackRate = 1.0;
+        } else if (lag > 0.3) {
+            // Drifting behind — speed up to catch up smoothly
+            videoEl.playbackRate = 1.1;
+        } else {
+            videoEl.playbackRate = 1.0;
         }
     }
 
@@ -150,12 +162,8 @@
         console.log(`Connecting to ${hubUrl}/mirrorHub for ${deviceId}/${sourceId}`);
         statusEl.textContent = 'Connecting to server...';
 
-        // Try WSS first (hubUrl might be https://), fall back to WS
         const connBuilder = new signalR.HubConnectionBuilder()
-            .withUrl(`${hubUrl}/mirrorHub`, {
-                skipNegotiation: true,
-                transport: signalR.HttpTransportType.WebSockets
-            })
+            .withUrl(`${hubUrl}/mirrorHub`)
             .withAutomaticReconnect();
 
         if (signalR.protocols && signalR.protocols.msgpack) {
