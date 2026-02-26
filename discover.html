@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Phone Mirror</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111; color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh;
+        }
+        .container { text-align: center; max-width: 480px; padding: 2rem; }
+        h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+        .subtitle { color: #888; margin-bottom: 1.5rem; font-size: 1rem; }
+        .view { display: none; }
+        .view.active { display: block; }
+
+        .spinner {
+            width: 40px; height: 40px;
+            border: 3px solid #333; border-top-color: #4af;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 1.5rem auto;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .bookmark-hint {
+            background: #1a2a1a; border: 1px solid #2a4a2a;
+            border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;
+            font-size: 0.9rem; color: #8c8;
+        }
+        .bookmark-hint kbd {
+            background: #222; border: 1px solid #444; border-radius: 3px;
+            padding: 1px 5px; font-size: 0.85em;
+        }
+
+        .btn-primary {
+            background: #4af; color: #000; border: none;
+            padding: 0.7rem 1.8rem; border-radius: 6px; font-size: 1rem;
+            cursor: pointer; font-weight: 600;
+            transition: background 0.15s;
+        }
+        .btn-primary:hover { background: #5bf; }
+        .btn-primary:active { background: #39e; }
+
+        .separator {
+            color: #555; margin: 1.2rem 0; font-size: 0.85rem;
+            display: flex; align-items: center; gap: 0.8rem;
+        }
+        .separator::before, .separator::after {
+            content: ''; flex: 1; height: 1px; background: #333;
+        }
+
+        .manual-form { display: flex; gap: 0.4rem; justify-content: center; align-items: center; }
+        .manual-form input {
+            background: #1a1a1a; border: 1px solid #333; color: #eee;
+            padding: 0.55rem 0.8rem; border-radius: 4px; font-size: 0.95rem;
+        }
+        .manual-form input.ip { width: 160px; }
+        .manual-form input.port { width: 70px; text-align: center; }
+        .manual-form .colon { color: #555; font-size: 1.2rem; }
+        .btn-go {
+            background: #333; color: #eee; border: 1px solid #444;
+            padding: 0.55rem 1rem; border-radius: 4px; font-size: 0.95rem;
+            cursor: pointer;
+        }
+        .btn-go:hover { background: #444; }
+
+        .remember-row {
+            margin-top: 1rem; font-size: 0.85rem; color: #888;
+        }
+        .remember-row label { cursor: pointer; }
+        .remember-row input { margin-right: 0.3rem; vertical-align: middle; }
+
+        .addr { color: #4af; font-family: monospace; font-size: 1.05rem; }
+        .success { color: #4f4; font-size: 1.2rem; margin-bottom: 0.5rem; }
+        .warning { color: #fa4; font-size: 1.1rem; margin-bottom: 0.5rem; }
+        .countdown { font-size: 0.95rem; color: #888; margin-top: 0.8rem; }
+
+        .link-row {
+            margin-top: 1.2rem; font-size: 0.85rem;
+        }
+        .link-row a {
+            color: #888; text-decoration: none; border-bottom: 1px dotted #555;
+        }
+        .link-row a:hover { color: #aaa; }
+        .link-row a + a { margin-left: 1.2rem; }
+
+        .changed-addrs {
+            margin: 1rem 0; font-size: 0.9rem; line-height: 1.8;
+        }
+        .changed-addrs .old { color: #888; text-decoration: line-through; }
+        .changed-addrs .new { color: #4f4; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Phone Mirror</h1>
+
+        <!-- State: New user / first visit -->
+        <div class="view" id="view-discover">
+            <p class="subtitle">Find your Phone Mirror server</p>
+            <div class="bookmark-hint">
+                Bookmark this page for easy access next time<br>
+                <kbd>Ctrl</kbd>+<kbd>D</kbd> or <kbd>&#8984;</kbd>+<kbd>D</kbd>
+            </div>
+            <button class="btn-primary" onclick="autoDiscover()">Find My Server</button>
+            <div class="separator">or enter address manually</div>
+            <div class="manual-form">
+                <input class="ip" id="addr" type="text" placeholder="192.168.1.100"
+                       enterkeyhint="go">
+                <span class="colon">:</span>
+                <input class="port" id="port" type="text" value="5053"
+                       enterkeyhint="go">
+                <button class="btn-go" onclick="manualConnect()">Go</button>
+            </div>
+            <div class="remember-row">
+                <label><input type="checkbox" id="remember" checked> Remember this server</label>
+            </div>
+        </div>
+
+        <!-- State: Returning user (has stored server) -->
+        <div class="view" id="view-connecting">
+            <p class="subtitle">Connecting to your server</p>
+            <div class="addr" id="connect-addr"></div>
+            <div class="spinner"></div>
+            <div class="link-row">
+                <a href="#" onclick="rediscover(); return false">Not working?</a>
+                <a href="#" onclick="forget(); return false">Forget server</a>
+            </div>
+        </div>
+
+        <!-- State: Server found via discovery -->
+        <div class="view" id="view-found">
+            <p class="success">Server found!</p>
+            <div class="addr" id="found-addr"></div>
+            <div class="countdown">Connecting in <span id="found-countdown"></span>...</div>
+        </div>
+
+        <!-- State: Server IP changed -->
+        <div class="view" id="view-changed">
+            <p class="warning">Server address changed</p>
+            <div class="changed-addrs">
+                <div>Was: <span class="old" id="old-addr"></span></div>
+                <div>Now: <span class="new" id="new-addr"></span></div>
+            </div>
+            <div class="countdown">Connecting in <span id="change-countdown"></span>...</div>
+            <div style="margin-top: 1rem;">
+                <button class="btn-primary" onclick="navigateNow()">Connect Now</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    'use strict';
+
+    const DEFAULT_PORT = 5053;
+    const STORAGE_KEY = 'phonemirror_server';
+    let pendingServer = null;
+    let pendingPort = null;
+
+    // --- localStorage helpers ---
+
+    function getStored() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+    }
+
+    function store(server, port) {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({ server, port }));
+        } catch {}
+    }
+
+    function clearStored() {
+        try { localStorage.removeItem(STORAGE_KEY); } catch {}
+    }
+
+    // --- Navigation ---
+
+    function serverUrl(server, port) {
+        return `http://${server}:${port}`;
+    }
+
+    function navigate(server, port) {
+        window.location.href = serverUrl(server, port);
+    }
+
+    function navigateNow() {
+        if (pendingServer) navigate(pendingServer, pendingPort);
+    }
+
+    function selfUrl() {
+        // Base URL of this page without query params
+        return location.origin + location.pathname;
+    }
+
+    // --- View management ---
+
+    function showView(name) {
+        document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+        const el = document.getElementById('view-' + name);
+        if (el) el.classList.add('active');
+    }
+
+    // --- Actions ---
+
+    function autoDiscover() {
+        // Navigate to the PhoneMirror server via mDNS hostname.
+        // The server's /api/discover endpoint will redirect back here
+        // with ?server=<ip>&port=<port> appended.
+        const returnUrl = encodeURIComponent(selfUrl());
+        window.location.href = `http://phonemirror.local:${DEFAULT_PORT}/api/discover?return=${returnUrl}`;
+    }
+
+    function manualConnect() {
+        const server = document.getElementById('addr').value.trim();
+        const port = parseInt(document.getElementById('port').value) || DEFAULT_PORT;
+        if (!server) return;
+
+        if (document.getElementById('remember').checked) {
+            store(server, port);
+        }
+        navigate(server, port);
+    }
+
+    function rediscover() {
+        // Try phonemirror.local auto-discovery
+        autoDiscover();
+    }
+
+    function forget() {
+        clearStored();
+        showView('discover');
+    }
+
+    // --- Countdown helper ---
+
+    function startCountdown(elementId, seconds, onDone) {
+        const el = document.getElementById(elementId);
+        let remaining = seconds;
+        el.textContent = remaining;
+        const timer = setInterval(() => {
+            remaining--;
+            el.textContent = remaining;
+            if (remaining <= 0) {
+                clearInterval(timer);
+                onDone();
+            }
+        }, 1000);
+        return timer;
+    }
+
+    // --- Init ---
+
+    // If loaded from the PhoneMirror server itself, redirect to root
+    const serverPorts = [5053, 7237];
+    if (serverPorts.includes(parseInt(location.port))) {
+        window.location.replace('/');
+    } else {
+        // Parse URL params — may contain discovery callback
+        const params = new URLSearchParams(location.search);
+        const discoveredServer = params.get('server');
+        const discoveredPort = parseInt(params.get('port')) || DEFAULT_PORT;
+
+        // Clean query params from URL without triggering navigation
+        if (discoveredServer) {
+            history.replaceState(null, '', selfUrl());
+        }
+
+        if (discoveredServer) {
+            // Returning from discovery round-trip
+            const stored = getStored();
+
+            if (stored && stored.server !== discoveredServer) {
+                // IP changed!
+                pendingServer = discoveredServer;
+                pendingPort = discoveredPort;
+                store(discoveredServer, discoveredPort);
+
+                showView('changed');
+                document.getElementById('old-addr').textContent =
+                    `${stored.server}:${stored.port || DEFAULT_PORT}`;
+                document.getElementById('new-addr').textContent =
+                    `${discoveredServer}:${discoveredPort}`;
+
+                startCountdown('change-countdown', 10,
+                    () => navigate(discoveredServer, discoveredPort));
+            } else {
+                // First discovery or same IP
+                store(discoveredServer, discoveredPort);
+
+                showView('found');
+                document.getElementById('found-addr').textContent =
+                    `${discoveredServer}:${discoveredPort}`;
+
+                startCountdown('found-countdown', 2,
+                    () => navigate(discoveredServer, discoveredPort));
+            }
+        } else {
+            const stored = getStored();
+
+            if (stored) {
+                // Return visit — auto-navigate to stored server
+                showView('connecting');
+                document.getElementById('connect-addr').textContent =
+                    `${stored.server}:${stored.port || DEFAULT_PORT}`;
+
+                setTimeout(() => navigate(stored.server, stored.port || DEFAULT_PORT), 1500);
+            } else {
+                // First visit — show discovery UI
+                showView('discover');
+            }
+        }
+    }
+
+    // Handle Enter key in manual input fields
+    document.querySelectorAll('.manual-form input').forEach(el => {
+        el.addEventListener('keydown', e => {
+            if (e.key === 'Enter') manualConnect();
+        });
+    });
+    </script>
+</body>
+</html>
