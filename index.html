@@ -26,7 +26,29 @@
 
     <script>
     'use strict';
-    const VERSION = 3;
+    const VERSION = 4;
+
+    // --- Remote logging: forward console output to server ---
+    let _logHubUrl = null;
+    function remoteLog(level, args) {
+        if (!_logHubUrl) return;
+        const msg = args.map(a => {
+            try { return typeof a === 'string' ? a : JSON.stringify(a); }
+            catch { return String(a); }
+        }).join(' ');
+        fetch(`${_logHubUrl}/api/cast/log`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ level, message: msg })
+        }).catch(() => {});
+    }
+    const _origLog = console.log, _origWarn = console.warn, _origError = console.error;
+    console.log = (...a) => { _origLog(...a); remoteLog('info', a); };
+    console.warn = (...a) => { _origWarn(...a); remoteLog('warn', a); };
+    console.error = (...a) => { _origError(...a); remoteLog('error', a); };
+    window.addEventListener('error', e => remoteLog('error', [`Uncaught: ${e.message} at ${e.filename}:${e.lineno}`]));
+    window.addEventListener('unhandledrejection', e => remoteLog('error', [`Unhandled rejection: ${e.reason}`]));
+
     console.log(`[PhoneMirror Cast Receiver v${VERSION}]`);
 
     const videoEl = document.getElementById('display');
@@ -213,6 +235,7 @@
             console.log('CASTV2 message received:', JSON.stringify(event.data));
             const { hubUrl, deviceId, sourceId } = event.data;
             if (hubUrl && deviceId && sourceId) {
+                _logHubUrl = hubUrl;
                 startSession(hubUrl, deviceId, sourceId);
             }
         });
