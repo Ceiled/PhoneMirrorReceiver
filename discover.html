@@ -37,6 +37,12 @@
             padding: 1px 5px; font-size: 0.85em;
         }
 
+        .error-hint {
+            background: #2a1a1a; border: 1px solid #4a2a2a;
+            border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;
+            font-size: 0.9rem; color: #c88;
+        }
+
         .btn-primary {
             background: #4af; color: #000; border: none;
             padding: 0.7rem 1.8rem; border-radius: 6px; font-size: 1rem;
@@ -122,7 +128,7 @@
             </div>
         </div>
 
-        <!-- State: Returning user (has stored server) -->
+        <!-- State: Returning user — verifying stored server -->
         <div class="view" id="view-connecting">
             <p class="subtitle">Connecting to your server</p>
             <div class="addr" id="connect-addr"></div>
@@ -130,6 +136,15 @@
             <div class="link-row">
                 <a href="#" onclick="rediscover(); return false">Not working?</a>
                 <a href="#" onclick="forget(); return false">Forget server</a>
+            </div>
+        </div>
+
+        <!-- State: Searching for server via mDNS -->
+        <div class="view" id="view-searching">
+            <p class="subtitle">Searching for server on your network...</p>
+            <div class="spinner"></div>
+            <div class="link-row">
+                <a href="#" onclick="skipSearch(); return false">Enter address manually</a>
             </div>
         </div>
 
@@ -152,6 +167,28 @@
                 <button class="btn-primary" onclick="navigateNow()">Connect Now</button>
             </div>
         </div>
+
+        <!-- State: Could not find server -->
+        <div class="view" id="view-notfound">
+            <p class="warning">Couldn't find your server</p>
+            <div class="error-hint">
+                Make sure Phone Mirror is running on your computer<br>
+                and that this device is on the same network.
+            </div>
+            <button class="btn-primary" onclick="autoDiscover()">Try Again</button>
+            <div class="separator">or enter address manually</div>
+            <div class="manual-form">
+                <input class="ip" id="addr2" type="text" placeholder="192.168.1.100"
+                       enterkeyhint="go">
+                <span class="colon">:</span>
+                <input class="port" id="port2" type="text" value="5053"
+                       enterkeyhint="go">
+                <button class="btn-go" onclick="manualConnect2()">Go</button>
+            </div>
+            <div class="remember-row">
+                <label><input type="checkbox" id="remember2" checked> Remember this server</label>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -159,6 +196,7 @@
 
     const DEFAULT_PORT = 5053;
     const STORAGE_KEY = 'phonemirror_server';
+    const ATTEMPT_KEY = 'phonemirror_attempt';
     let pendingServer = null;
     let pendingPort = null;
 
@@ -181,10 +219,34 @@
         try { localStorage.removeItem(STORAGE_KEY); } catch {}
     }
 
+    // --- sessionStorage helpers for tracking navigation attempts ---
+
+    function getAttempt() {
+        try {
+            const raw = sessionStorage.getItem(ATTEMPT_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+    }
+
+    function setAttempt(target, step) {
+        try {
+            sessionStorage.setItem(ATTEMPT_KEY, JSON.stringify({ target, step }));
+        } catch {}
+    }
+
+    function clearAttempt() {
+        try { sessionStorage.removeItem(ATTEMPT_KEY); } catch {}
+    }
+
     // --- Navigation ---
 
     function serverUrl(server, port) {
         return `http://${server}:${port}`;
+    }
+
+    function discoverUrl(server, port) {
+        const returnUrl = encodeURIComponent(selfUrl());
+        return `http://${server}:${port}/api/discover?return=${returnUrl}`;
     }
 
     function navigate(server, port) {
@@ -196,7 +258,6 @@
     }
 
     function selfUrl() {
-        // Base URL of this page without query params
         return location.origin + location.pathname;
     }
 
@@ -208,14 +269,116 @@
         if (el) el.classList.add('active');
     }
 
+    // --- IP prefix helper ---
+
+    function getIpPrefix(ip) {
+        if (!ip) return '';
+        const parts = ip.split('.');
+        if (parts.length === 4) return parts.slice(0, 3).join('.') + '.';
+        return '';
+    }
+
+    function prefillManualFields(storedServer) {
+        const prefix = getIpPrefix(storedServer);
+        if (prefix) {
+            const addr1 = document.getElementById('addr');
+            const addr2 = document.getElementById('addr2');
+            if (addr1 && !addr1.value) addr1.placeholder = prefix + 'x';
+            if (addr2 && !addr2.value) addr2.placeholder = prefix + 'x';
+        }
+    }
+
+    // --- Server probing ---
+
+    // Try to reach a server via fetch. Returns { server, port } on success, null on failure.
+    // Works from file:// and http:// contexts. From https://, fails instantly due to
+    // mixed content — caller should fall back to navigation-based discovery.
+    async function probeServer(host, port) {
+        try {
+            const url = `http://${host}:${port}/api/discover`;
+            const resp = await fetch(url, {
+                mode: 'cors',
+                signal: AbortSignal.timeout(4000)
+            });
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            return (data && data.server) ? data : null;
+        } catch {
+            return null;
+        }
+    }
+
+    // Chain of discovery attempts:
+    // 1. Probe stored server (if any)
+    // 2. Probe phonemirror.local
+    // 3. Fall back to navigation-based mDNS (last resort, may show browser error)
+    async function discoverServer(stored) {
+        // Step 1: Try stored server
+        if (stored) {
+            showView('connecting');
+            document.getElementById('connect-addr').textContent =
+                `${stored.server}:${stored.port || DEFAULT_PORT}`;
+
+            const result = await probeServer(stored.server, stored.port || DEFAULT_PORT);
+            if (result) {
+                return result;
+            }
+        }
+
+        // Step 2: Try phonemirror.local
+        showView('searching');
+        const mdnsResult = await probeServer('phonemirror.local', DEFAULT_PORT);
+        if (mdnsResult) {
+            return mdnsResult;
+        }
+
+        // Step 3: fetch failed (mixed content on HTTPS, or server truly unreachable).
+        // Last resort: navigate to phonemirror.local and let the browser resolve it.
+        // Use sessionStorage to detect if this navigation fails.
+        setAttempt('phonemirror.local', 'mdns');
+        window.location.href = discoverUrl('phonemirror.local', DEFAULT_PORT);
+        // If navigation succeeds, we leave this page. If it fails and user comes back,
+        // the sessionStorage attempt flag will trigger the "not found" screen.
+        return null;
+    }
+
+    // Run discovery and handle the result
+    async function runDiscovery(stored) {
+        const result = await discoverServer(stored);
+        if (!result) return; // navigated away or will be handled on return
+
+        handleDiscoveryResult(result.server, parseInt(result.port) || DEFAULT_PORT, stored);
+    }
+
+    function handleDiscoveryResult(server, port, previousStored) {
+        if (previousStored && previousStored.server !== server) {
+            // IP changed
+            pendingServer = server;
+            pendingPort = port;
+            store(server, port);
+
+            showView('changed');
+            document.getElementById('old-addr').textContent =
+                `${previousStored.server}:${previousStored.port || DEFAULT_PORT}`;
+            document.getElementById('new-addr').textContent =
+                `${server}:${port}`;
+
+            startCountdown('change-countdown', 10, () => navigate(server, port));
+        } else {
+            // Found (first time or same IP)
+            store(server, port);
+
+            showView('found');
+            document.getElementById('found-addr').textContent = `${server}:${port}`;
+
+            startCountdown('found-countdown', 2, () => navigate(server, port));
+        }
+    }
+
     // --- Actions ---
 
     function autoDiscover() {
-        // Navigate to the PhoneMirror server via mDNS hostname.
-        // The server's /api/discover endpoint will redirect back here
-        // with ?server=<ip>&port=<port> appended.
-        const returnUrl = encodeURIComponent(selfUrl());
-        window.location.href = `http://phonemirror.local:${DEFAULT_PORT}/api/discover?return=${returnUrl}`;
+        runDiscovery(getStored());
     }
 
     function manualConnect() {
@@ -229,13 +392,32 @@
         navigate(server, port);
     }
 
+    function manualConnect2() {
+        const server = document.getElementById('addr2').value.trim();
+        const port = parseInt(document.getElementById('port2').value) || DEFAULT_PORT;
+        if (!server) return;
+
+        if (document.getElementById('remember2').checked) {
+            store(server, port);
+        }
+        navigate(server, port);
+    }
+
     function rediscover() {
-        // Try phonemirror.local auto-discovery
+        clearAttempt();
         autoDiscover();
     }
 
     function forget() {
         clearStored();
+        clearAttempt();
+        showView('discover');
+    }
+
+    function skipSearch() {
+        clearAttempt();
+        const stored = getStored();
+        prefillManualFields(stored && stored.server);
         showView('discover');
     }
 
@@ -273,45 +455,25 @@
             history.replaceState(null, '', selfUrl());
         }
 
+        // Check for a previous failed navigation attempt
+        const attempt = getAttempt();
+        clearAttempt();
+
         if (discoveredServer) {
-            // Returning from discovery round-trip
+            // Successfully returned from discovery navigation round-trip
+            clearAttempt();
+            handleDiscoveryResult(discoveredServer, discoveredPort, getStored());
+        } else if (attempt) {
+            // Back from a failed navigation attempt (mDNS navigation didn't work)
             const stored = getStored();
-
-            if (stored && stored.server !== discoveredServer) {
-                // IP changed!
-                pendingServer = discoveredServer;
-                pendingPort = discoveredPort;
-                store(discoveredServer, discoveredPort);
-
-                showView('changed');
-                document.getElementById('old-addr').textContent =
-                    `${stored.server}:${stored.port || DEFAULT_PORT}`;
-                document.getElementById('new-addr').textContent =
-                    `${discoveredServer}:${discoveredPort}`;
-
-                startCountdown('change-countdown', 10,
-                    () => navigate(discoveredServer, discoveredPort));
-            } else {
-                // First discovery or same IP
-                store(discoveredServer, discoveredPort);
-
-                showView('found');
-                document.getElementById('found-addr').textContent =
-                    `${discoveredServer}:${discoveredPort}`;
-
-                startCountdown('found-countdown', 2,
-                    () => navigate(discoveredServer, discoveredPort));
-            }
+            prefillManualFields(stored && stored.server);
+            showView('notfound');
         } else {
             const stored = getStored();
 
             if (stored) {
-                // Return visit — auto-navigate to stored server
-                showView('connecting');
-                document.getElementById('connect-addr').textContent =
-                    `${stored.server}:${stored.port || DEFAULT_PORT}`;
-
-                setTimeout(() => navigate(stored.server, stored.port || DEFAULT_PORT), 1500);
+                // Return visit — probe stored server, then try mDNS
+                runDiscovery(stored);
             } else {
                 // First visit — show discovery UI
                 showView('discover');
@@ -320,9 +482,14 @@
     }
 
     // Handle Enter key in manual input fields
-    document.querySelectorAll('.manual-form input').forEach(el => {
+    document.querySelectorAll('#view-discover .manual-form input').forEach(el => {
         el.addEventListener('keydown', e => {
             if (e.key === 'Enter') manualConnect();
+        });
+    });
+    document.querySelectorAll('#view-notfound .manual-form input').forEach(el => {
+        el.addEventListener('keydown', e => {
+            if (e.key === 'Enter') manualConnect2();
         });
     });
     </script>
